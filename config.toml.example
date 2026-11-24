@@ -248,5 +248,10 @@ max_articles_per_feed = 25
 # Settings for duplicate/similar article detection and story merging
 similarity_threshold = 0.65  # Lower value for better story merging (0.65 = 65% similarity)
 
+# Threshold for grouping legacy articles (no persistent story group) at digest
+# time. Articles processed by current versions are grouped persistently at
+# processing time using similarity_threshold above; this is only a fallback.
+digest_similarity_threshold = 0.6
+
 # Whether to analyze articles during ingestion for better performance
 analyze_during_ingestion = true

@@ -14,7 +14,7 @@ from annoy import AnnoyIndex
 from rich.progress import Progress, TextColumn, BarColumn, SpinnerColumn, TimeElapsedColumn, TimeRemainingColumn, TaskProgressColumn
 
 from .config import Config
-from .models import Article, Feed
+from .models import Article, Feed, StoryGroup
 from .rss import process_all_feeds
 
 # Configure logging
@@ -613,6 +613,306 @@ class RSSProcessor:
 
         return groups
 
+    @staticmethod
+    def _authority_key(article: Article) -> Tuple:
+        """
+        Authority ranking key for an article (higher is more authoritative).
+
+        Ranking components, in order of precedence:
+        1. Quality tier (S > A > B > C > D)
+        2. Quality score (1-100)
+        3. Word count (more detailed coverage)
+        4. Earlier publication (original reporting preferred on ties)
+        5. Lower article id (deterministic tie-break)
+        """
+        published_ts = article.published_at.timestamp() if article.published_at else float("inf")
+        return (
+            QUALITY_TIERS.get(article.quality_tier, 0),
+            article.quality_score or 0,
+            article.word_count or 0,
+            -published_ts,
+            -(article.id or 0),
+        )
+
+    def _select_group_representative(self, articles: List[Article]) -> Article:
+        """Elect the most authoritative article as the stable representative of a group."""
+        return max(articles, key=self._authority_key)
+
+    @staticmethod
+    def _cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
+        """Compute cosine similarity between two embedding vectors."""
+        import math
+
+        if not vec1 or not vec2 or len(vec1) != len(vec2):
+            return 0.0
+        dot = sum(a * b for a, b in zip(vec1, vec2))
+        norm1 = math.sqrt(sum(a * a for a in vec1))
+        norm2 = math.sqrt(sum(b * b for b in vec2))
+        if norm1 == 0 or norm2 == 0:
+            return 0.0
+        return dot / (norm1 * norm2)
+
+    @staticmethod
+    def _parse_embedding_vector(article: Article) -> Optional[List[float]]:
+        """Parse an article's stored embedding vector, or None if unavailable."""
+        if not article.embedding_vector:
+            return None
+        try:
+            return json.loads(article.embedding_vector)
+        except (json.JSONDecodeError, TypeError):
+            return None
+
+    def _find_matching_story_group(self, article: Article, threshold: float) -> Optional[StoryGroup]:
+        """
+        Find an existing persistent story group for an article by comparing it
+        against the stable representatives of all known groups.
+
+        Uses the same title/URL weighting as _find_title_similar_articles plus
+        content similarity from stored embedding vectors.
+
+        Args:
+            article: Article to place
+            threshold: Similarity threshold for a match
+
+        Returns:
+            The best matching StoryGroup, or None
+        """
+        groups = (
+            self.db_session.query(StoryGroup)
+            .filter(StoryGroup.representative_article_id.isnot(None))
+            .all()
+        )
+        if not groups:
+            return None
+
+        article_vector = self._parse_embedding_vector(article)
+
+        best_group = None
+        best_score = 0.0
+
+        for group in groups:
+            representative = group.representative
+            if not representative or representative.id == article.id:
+                continue
+
+            title_similarity = self._calculate_title_similarity(article.title or "", representative.title or "")
+            url_similarity = self._calculate_url_similarity(article.url, representative.url)
+            combined_similarity = 0.8 * title_similarity + 0.2 * url_similarity
+
+            # Same adaptive thresholding as _find_title_similar_articles
+            effective_threshold = threshold - 0.15
+            if url_similarity > 0.8:
+                effective_threshold -= 0.1
+
+            content_similarity = 0.0
+            representative_vector = self._parse_embedding_vector(representative)
+            if article_vector and representative_vector:
+                content_similarity = self._cosine_similarity(article_vector, representative_vector)
+
+            if combined_similarity >= effective_threshold or content_similarity >= threshold:
+                score = max(combined_similarity, content_similarity)
+                if score > best_score:
+                    best_group = group
+                    best_score = score
+
+        if best_group:
+            logger.info(
+                f"Article '{article.title[:60]}' matches story group #{best_group.id} "
+                f"(score {best_score:.2f}, threshold {threshold:.2f})"
+            )
+        return best_group
+
+    def _persist_article_groups(self, article_groups: List[List[Article]]) -> List[StoryGroup]:
+        """
+        Persist article groups as StoryGroup records with stable representatives.
+
+        For each computed group:
+        - If any member already belongs to a persistent group, or matches the
+          representative of one (e.g. the same story fetched in an earlier
+          run), the articles join that group.
+        - Otherwise a new StoryGroup is created, recording the similarity
+          threshold in effect at formation time.
+        - The representative is re-elected over all members (old and new), so
+          a more authoritative version replaces the previous one. Replaced
+          representatives keep their group_id, so old index entries and old
+          digest links still resolve to the group.
+
+        Note: if members of one batch group match different existing groups,
+        the first match wins (no transitive group-group merge).
+
+        Args:
+            article_groups: Groups of articles (from batch grouping)
+
+        Returns:
+            List of StoryGroup records that were created or updated
+        """
+        threshold = self.config.similarity_threshold
+        story_groups = []
+
+        for group_articles in article_groups:
+            if not group_articles:
+                continue
+
+            # Prefer a group one of the members already belongs to
+            story_group = None
+            for article in group_articles:
+                if article.group_id:
+                    story_group = self.db_session.query(StoryGroup).filter_by(id=article.group_id).first()
+                    if story_group:
+                        break
+
+            # Otherwise try to attach to an existing group via its representative
+            if story_group is None:
+                for article in group_articles:
+                    story_group = self._find_matching_story_group(article, threshold)
+                    if story_group:
+                        break
+
+            # Otherwise create a new persistent group
+            if story_group is None:
+                story_group = StoryGroup(
+                    similarity_threshold=threshold,
+                    created_at=datetime.utcnow(),
+                    updated_at=datetime.utcnow(),
+                )
+                self.db_session.add(story_group)
+                self.db_session.flush()  # assign id
+
+            # Collect existing members before attaching the new ones
+            existing_members = self.db_session.query(Article).filter_by(group_id=story_group.id).all()
+            all_members = {a.id: a for a in existing_members}
+            for article in group_articles:
+                article.group_id = story_group.id
+                all_members[article.id] = article
+
+            # Re-elect the representative across all members (old + new)
+            representative = self._select_group_representative(list(all_members.values()))
+            previous_id = story_group.representative_article_id
+            if previous_id != representative.id:
+                story_group.representative_article_id = representative.id
+                if previous_id is not None:
+                    logger.info(
+                        f"Story group #{story_group.id}: representative article #{previous_id} "
+                        f"replaced by more authoritative version #{representative.id} "
+                        f"('{representative.title[:60]}')"
+                    )
+            story_group.updated_at = datetime.utcnow()
+            story_groups.append(story_group)
+
+        self.db_session.commit()
+        return story_groups
+
+    def _group_articles_for_assignment(self, articles: List[Article], threshold: float) -> List[List[Article]]:
+        """
+        Group an arbitrary set of articles among themselves by similarity.
+
+        Unlike _group_similar_articles (which only considers unprocessed
+        articles), this works on any article set and is used to assign
+        persistent story groups to articles that were processed outside of
+        process_articles (e.g. analyzed during ingestion).
+
+        Args:
+            articles: Articles to group among themselves
+            threshold: Similarity threshold
+
+        Returns:
+            List of article groups
+        """
+        groups = []
+        assigned_ids = set()
+        vectors = {a.id: self._parse_embedding_vector(a) for a in articles}
+
+        for article in articles:
+            if article.id in assigned_ids:
+                continue
+            group = [article]
+            assigned_ids.add(article.id)
+
+            for other in articles:
+                if other.id == article.id or other.id in assigned_ids:
+                    continue
+
+                title_similarity = self._calculate_title_similarity(article.title or "", other.title or "")
+                url_similarity = self._calculate_url_similarity(article.url, other.url)
+                combined_similarity = 0.8 * title_similarity + 0.2 * url_similarity
+
+                effective_threshold = threshold - 0.15
+                if url_similarity > 0.8:
+                    effective_threshold -= 0.1
+
+                content_similarity = 0.0
+                if vectors.get(article.id) and vectors.get(other.id):
+                    content_similarity = self._cosine_similarity(vectors[article.id], vectors[other.id])
+
+                if combined_similarity >= effective_threshold or content_similarity >= threshold:
+                    group.append(other)
+                    assigned_ids.add(other.id)
+
+            groups.append(group)
+
+        return groups
+
+    def assign_story_groups(self, articles: Optional[List[Article]] = None) -> List[StoryGroup]:
+        """
+        Assign persistent story groups to articles that don't have one yet.
+
+        Covers articles that never went through process_articles grouping
+        (e.g. analyzed during ingestion, or processed before persistent
+        groups existed). New articles join existing groups when they match
+        the group's stable representative, so a story first seen in an
+        earlier run is enriched rather than duplicated.
+
+        Args:
+            articles: Articles to assign (default: all articles without a group)
+
+        Returns:
+            List of StoryGroup records that were created or updated
+        """
+        if articles is None:
+            articles = self.db_session.query(Article).filter(Article.group_id.is_(None)).all()
+
+        unassigned = [a for a in articles if a.group_id is None]
+        if not unassigned:
+            return []
+
+        threshold = self.config.similarity_threshold
+        batch_groups = self._group_articles_for_assignment(unassigned, threshold)
+        story_groups = self._persist_article_groups(batch_groups)
+        logger.info(f"Assigned {len(unassigned)} articles to {len(story_groups)} story groups")
+        return story_groups
+
+    def resolve_story_group(self, article_id: int) -> Optional[Dict[str, Any]]:
+        """
+        Resolve the story group for any article id, including articles whose
+        representative role was later taken over by a more authoritative
+        version.
+
+        This lets old index entries (vector index ids, old digest links) find
+        the group the article belongs to and the group's current
+        representative.
+
+        Args:
+            article_id: Id of any member article (current or superseded)
+
+        Returns:
+            Dictionary with group details, or None if the article has no group
+        """
+        article = self.db_session.query(Article).filter_by(id=article_id).first()
+        if not article or not article.group_id:
+            return None
+
+        group = self.db_session.query(StoryGroup).filter_by(id=article.group_id).first()
+        if not group:
+            return None
+
+        return {
+            "group_id": group.id,
+            "representative_article_id": group.representative_article_id,
+            "similarity_threshold": group.similarity_threshold,
+            "member_article_ids": [member.id for member in group.members],
+            "is_representative": group.representative_article_id == article_id,
+        }
+
     def _generate_grouped_summary(self, articles: List[Article]) -> Optional[str]:
         """
         Generate a summary for a group of similar articles.
@@ -656,13 +956,16 @@ class RSSProcessor:
         all_content = "\n\n".join(combined_content)
         all_sources = "\n".join(sources)
 
-        grouped_prompt = f"""You are summarizing multiple articles about the same topic or event. 
+        grouped_prompt = f"""You are summarizing multiple articles about the same topic or event.
 
 Create a comprehensive summary that:
 1. Identifies the main topic/event being covered
 2. Combines information from all sources into a coherent narrative
 3. Notes any different perspectives or additional details from different sources
 4. Provides key insights and takeaways
+5. Preserves attribution to EVERY confirmed source listed below — name each
+   outlet at least once (e.g. "according to <feed name>") so that no confirmed
+   source is dropped from the record
 
 Sources:
 {all_sources}
@@ -670,7 +973,7 @@ Sources:
 Combined Content:
 {all_content}
 
-Provide a comprehensive summary that synthesizes information from all sources."""
+Provide a comprehensive summary that synthesizes information from all sources and retains every confirmed source by name."""
 
         return self._call_openrouter_api(grouped_prompt)
 
@@ -690,7 +993,7 @@ Provide a comprehensive summary that synthesizes information from all sources.""
 
         if not unprocessed:
             logger.info("No unprocessed articles found")
-            return {"articles_processed": 0, "with_summary": 0, "with_value": 0, "with_embedding": 0, "groups_processed": 0}
+            return {"articles_processed": 0, "with_summary": 0, "with_value": 0, "with_embedding": 0, "groups_processed": 0, "story_groups": 0}
 
         # Initialize counters
         stats = {
@@ -698,7 +1001,8 @@ Provide a comprehensive summary that synthesizes information from all sources.""
             "with_summary": 0,
             "with_value": 0,
             "with_embedding": 0,
-            "groups_processed": 0
+            "groups_processed": 0,
+            "story_groups": 0
         }
 
         # Track feed statistics updates
@@ -809,6 +1113,12 @@ Provide a comprehensive summary that synthesizes information from all sources.""
                             stats["articles_processed"] += 1
                             progress.update(summary_task, advance=1)
                     self.db_session.commit()
+
+        # Persist story groups with stable representatives and the similarity
+        # threshold used, so digests can merge reposted stories and old index
+        # entries keep resolving to their group
+        story_groups = self._persist_article_groups(article_groups)
+        stats["story_groups"] = len(story_groups)
 
         # Update feed statistics
         self._update_feed_statistics(feed_stats)
@@ -982,7 +1292,8 @@ Provide a comprehensive summary that synthesizes information from all sources.""
                         "excerpt": excerpt,
                         "quality_tier": article.quality_tier,
                         "quality_score": article.quality_score,
-                        "relevance": similarity
+                        "relevance": similarity,
+                        "group_id": article.group_id
                     })
 
         # Sort by relevance
@@ -1059,13 +1370,16 @@ Provide a comprehensive summary that synthesizes information from all sources.""
 
         return excerpt
 
-    def _generate_aggregated_summary(self, articles: List[Article], filename: str = None) -> Optional[str]:
+    def _generate_aggregated_summary(self, articles: List[Article], filename: str = None, story_groups: Optional[List[Dict[str, Any]]] = None) -> Optional[str]:
         """
         Generate an aggregated summary of articles categorized by subject matter.
 
         Args:
             articles: List of articles to summarize
             filename: Name of the digest file (without extension)
+            story_groups: Optional group views (from _build_group_views). When
+                provided, merged stories appear as a single entry that retains
+                every confirmed source.
 
         Returns:
             Aggregated summary text or None if generation failed
@@ -1076,33 +1390,70 @@ Provide a comprehensive summary that synthesizes information from all sources.""
 
         # Prepare article summaries for the prompt
         article_summaries = []
-        for article in articles:
-            feed = self.db_session.query(Feed).filter_by(id=article.feed_id).first()
-            feed_name = feed.title if feed else "Unknown Feed"
 
-            # Format: Title (Feed) - Summary with internal link
-            # Store the article title for later reference in Obsidian internal link format
-            article_title = article.title
+        if story_groups is not None:
+            # Group-aware formatting: one entry per story, merged stories keep
+            # every confirmed source so the overview never drops one
+            for view in story_groups:
+                members = view["members"]
+                representative = view["representative"]
+                feed = self.db_session.query(Feed).filter_by(id=representative.feed_id).first()
+                feed_name = feed.title if feed else "Unknown Feed"
 
-            # Use Obsidian internal link format for the LLM to reference
-            summary_text = f"## **{article.title}** ({feed_name})\n"
+                summary_text = f"## **{representative.title}** ({feed_name})\n"
+                summary_text += f"Source: {representative.url}\n"
 
-            # Add URL as plain text
-            summary_text += f"Source: {article.url}\n"
+                if len(members) > 1:
+                    confirmed = []
+                    for member in members:
+                        member_feed = self.db_session.query(Feed).filter_by(id=member.feed_id).first()
+                        member_feed_name = member_feed.title if member_feed else "Unknown Feed"
+                        confirmed.append(f"{member_feed_name}: {member.url}")
+                    summary_text += "Confirmed sources: " + "; ".join(confirmed) + "\n"
+                    if view["anchor"]:
+                        summary_text += (
+                            f"Story group: {view['anchor']} "
+                            f"(merged at >= {view['threshold']:.2f} similarity)\n"
+                        )
 
-            # Add quality tier if available
-            if article.quality_tier:
-                summary_text += f"Quality: {article.quality_tier}-Tier\n"
+                if representative.quality_tier:
+                    summary_text += f"Quality: {representative.quality_tier}-Tier\n"
+                if representative.labels:
+                    summary_text += f"Labels: {representative.labels}\n"
 
-            # Add labels if available
-            if article.labels:
-                summary_text += f"Labels: {article.labels}\n"
+                summary = representative.summary or next((m.summary for m in members if m.summary), None)
+                if summary:
+                    summary_text += f"\n{summary}\n"
 
-            # Add the article summary
-            if article.summary:
-                summary_text += f"\n{article.summary}\n"
+                article_summaries.append(summary_text)
+        else:
+            for article in articles:
+                feed = self.db_session.query(Feed).filter_by(id=article.feed_id).first()
+                feed_name = feed.title if feed else "Unknown Feed"
 
-            article_summaries.append(summary_text)
+                # Format: Title (Feed) - Summary with internal link
+                # Store the article title for later reference in Obsidian internal link format
+                article_title = article.title
+
+                # Use Obsidian internal link format for the LLM to reference
+                summary_text = f"## **{article.title}** ({feed_name})\n"
+
+                # Add URL as plain text
+                summary_text += f"Source: {article.url}\n"
+
+                # Add quality tier if available
+                if article.quality_tier:
+                    summary_text += f"Quality: {article.quality_tier}-Tier\n"
+
+                # Add labels if available
+                if article.labels:
+                    summary_text += f"Labels: {article.labels}\n"
+
+                # Add the article summary
+                if article.summary:
+                    summary_text += f"\n{article.summary}\n"
+
+                article_summaries.append(summary_text)
 
         # Join all summaries with separators
         all_summaries = "\n---\n".join(article_summaries)
@@ -1118,24 +1469,38 @@ Provide a comprehensive summary that synthesizes information from all sources.""
 
         if llm_output and filename:
             # Process the output to replace external links with Obsidian internal links
-            return self._process_aggregated_summary(llm_output, filename, articles)
+            return self._process_aggregated_summary(llm_output, filename, articles, story_groups)
 
         return llm_output
 
-    def _process_aggregated_summary(self, summary: str, filename: str, articles: List[Article]) -> str:
+    def _process_aggregated_summary(self, summary: str, filename: str, articles: List[Article], story_groups: Optional[List[Dict[str, Any]]] = None) -> str:
         """
         Process the aggregated summary to replace external links with Obsidian internal links.
+
+        Links referencing any member of a merged story group are rewritten to
+        the group's stable block anchor, so the link keeps targeting the group
+        even when a different member currently represents it.
 
         Args:
             summary: The aggregated summary text
             filename: The filename of the digest
             articles: List of articles
+            story_groups: Optional group views (from _build_group_views)
 
         Returns:
             Processed summary text
         """
         # Create a mapping of article titles to use for replacements
         article_titles = {article.title: article for article in articles}
+
+        # Map every member title of a merged story group to its stable anchor
+        member_title_to_anchor = {}
+        if story_groups:
+            for view in story_groups:
+                if view["anchor"] and len(view["members"]) > 1:
+                    for member in view["members"]:
+                        if member.title:
+                            member_title_to_anchor[member.title] = view["anchor"]
 
         # Regular expression to find markdown links: [Title](URL)
         link_pattern = r'\[([^\]]+)\]\(([^\)]+)\)'
@@ -1147,12 +1512,17 @@ Provide a comprehensive summary that synthesizes information from all sources.""
             # Clean up the title (remove ** or other markdown formatting)
             clean_title = re.sub(r'[\*_`]', '', title)
 
-            # Check if this title exists in our articles
-            for article_title, article in article_titles.items():
-                # Check if the clean title is similar to an article title
-                if clean_title in article_title or article_title in clean_title:
-                    # If the URL is an external link, replace with Obsidian internal link
-                    if url.startswith('http'):
+            if url.startswith('http'):
+                # Merged story groups first: link to the stable group anchor
+                for member_title, anchor in member_title_to_anchor.items():
+                    if clean_title in member_title or member_title in clean_title:
+                        return f'[[{filename}#^{anchor}|{title}]]'
+
+                # Check if this title exists in our articles
+                for article_title, article in article_titles.items():
+                    # Check if the clean title is similar to an article title
+                    if clean_title in article_title or article_title in clean_title:
+                        # If the URL is an external link, replace with Obsidian internal link
                         return f'[[{filename}#{article_title}|{title}]]'
 
             # If no match or not an external link, return the original
@@ -1195,9 +1565,9 @@ Provide a comprehensive summary that synthesizes information from all sources.""
                     other_article.title and article.title):
                     
                     title_similarity = self._calculate_title_similarity(article.title, other_article.title)
-                    
+
                     # Use a lower threshold for digest grouping to catch more similar articles
-                    if title_similarity >= 0.6:  # 60% title similarity
+                    if title_similarity >= self.config.digest_similarity_threshold:
                         logger.info(f"Grouping for digest: {title_similarity:.2f} similarity between '{article.title}' and '{other_article.title}'")
                         group.append(other_article)
                         processed_ids.add(other_article.id)
@@ -1213,8 +1583,68 @@ Provide a comprehensive summary that synthesizes information from all sources.""
                     logger.info(f"  Group {i+1}: {len(group)} articles")
                     for article in group:
                         logger.info(f"    - {article.title[:60]}...")
-        
+
         return groups
+
+    def _build_group_views(self, articles: List[Article]) -> List[Dict[str, Any]]:
+        """
+        Build display views for a set of articles: persistent story groups
+        where available, ephemeral similarity groups as a legacy fallback for
+        articles that have no persistent group.
+
+        Each view carries the stable representative, the similarity threshold
+        the group was merged at, and a stable block anchor for digest links.
+
+        Args:
+            articles: Articles to build views for
+
+        Returns:
+            List of view dictionaries with keys: story_group, members,
+            representative, threshold, anchor
+        """
+        group_id_to_members = defaultdict(list)
+        ungrouped = []
+        for article in articles:
+            if article.group_id:
+                group_id_to_members[article.group_id].append(article)
+            else:
+                ungrouped.append(article)
+
+        views = []
+        for group_id, members in group_id_to_members.items():
+            story_group = self.db_session.query(StoryGroup).filter_by(id=group_id).first()
+
+            # Prefer the group's stable representative when it is part of the
+            # displayed set; otherwise elect one from the displayed members
+            representative = None
+            if story_group and story_group.representative:
+                if any(m.id == story_group.representative_article_id for m in members):
+                    representative = story_group.representative
+            if representative is None:
+                representative = self._select_group_representative(members)
+
+            views.append({
+                "story_group": story_group,
+                "members": sorted(members, key=self._authority_key, reverse=True),
+                "representative": representative,
+                "threshold": story_group.similarity_threshold if story_group else self.config.similarity_threshold,
+                "anchor": f"story-group-{story_group.id}" if story_group else None,
+            })
+
+        # Legacy fallback for articles processed before persistent groups existed
+        if ungrouped:
+            for legacy_group in self._group_articles_for_digest(ungrouped):
+                views.append({
+                    "story_group": None,
+                    "members": sorted(legacy_group, key=self._authority_key, reverse=True),
+                    "representative": self._select_group_representative(legacy_group),
+                    "threshold": self.config.digest_similarity_threshold,
+                    "anchor": None,
+                })
+
+        # Order views by the authority of their representative
+        views.sort(key=lambda v: self._authority_key(v["representative"]), reverse=True)
+        return views
 
     def generate_digest(self, lookback_days: int = 7) -> Dict[str, Any]:
         """
@@ -1247,7 +1677,8 @@ Provide a comprehensive summary that synthesizes information from all sources.""
                 "to_date": to_date_str,
                 "summary_items": "No articles processed in this period.",
                 "feed_stats": "No data available.",
-                "articles": []
+                "articles": [],
+                "story_groups": []
             }
 
         # Filter by quality tier
@@ -1302,11 +1733,20 @@ Provide a comprehensive summary that synthesizes information from all sources.""
         if formatted_filename.endswith(".md"):
             formatted_filename = formatted_filename[:-3]
 
-        # Generate aggregated summary with filename
-        aggregated_summary = self._generate_aggregated_summary(high_value_articles, formatted_filename)
+        # Build group views over all high-value articles: persistent story
+        # groups with stable representatives where available, ephemeral
+        # similarity groups as a legacy fallback
+        all_views = self._build_group_views(high_value_articles)
+
+        # Generate aggregated summary with filename (group-aware: merged
+        # stories appear once and retain every confirmed source)
+        aggregated_summary = self._generate_aggregated_summary(
+            high_value_articles, formatted_filename, story_groups=all_views
+        )
 
         # Build summary items
         summary_items = []
+        story_group_entries = {}
         for topic, topic_articles in sorted_topics:
             summary_items.append(f"## {topic}")
 
@@ -1326,29 +1766,21 @@ Provide a comprehensive summary that synthesizes information from all sources.""
                     # Keep the article with higher quality tier (already sorted by quality)
                     # Since articles are sorted by quality, the first one is already the best
                     continue
-            
-            deduplicated_articles = list(url_to_best_article.values())
-            
-            # Group similar articles for display - use improved similarity detection
-            article_groups = self._group_articles_for_digest(deduplicated_articles)
-            
-            # Convert groups to summary groups format for compatibility
-            summary_groups = {}
-            for i, group in enumerate(article_groups):
-                if len(group) == 1:
-                    # Single article
-                    article = group[0]
-                    summary_key = article.summary if article.summary else f"no_summary_{article.id}"
-                    summary_groups[summary_key] = group
-                else:
-                    # Multiple similar articles
-                    summary_key = f"grouped_{i}"
-                    summary_groups[summary_key] = group
 
-            for summary_key, articles_in_group in summary_groups.items():
-                if len(articles_in_group) == 1:
+            deduplicated_articles = list(url_to_best_article.values())
+
+            # Build display views: persistent story groups (stable
+            # representative + recorded threshold) with a legacy ephemeral
+            # grouping fallback for ungrouped articles
+            views = self._build_group_views(deduplicated_articles)
+
+            for view in views:
+                members = view["members"]
+                representative = view["representative"]
+
+                if len(members) == 1:
                     # Single article - display normally
-                    article = articles_in_group[0]
+                    article = members[0]
                     feed = self.db_session.query(Feed).filter_by(id=article.feed_id).first()
                     feed_name = feed.title if feed else "Unknown Feed"
 
@@ -1361,72 +1793,74 @@ Provide a comprehensive summary that synthesizes information from all sources.""
 
                     if article.summary:
                         summary_items.append(f"{article.summary}\n")
-                else:
-                    # Multiple articles with same summary - display as merged story
-                    logger.info(f"Displaying {len(articles_in_group)} similar articles as a merged story")
-                    
-                    # Create a comprehensive title by finding the most detailed/informative one
-                    titles = [a.title for a in articles_in_group if a.title]
-                    if titles:
-                        # Sort by length (descending) and informativeness to pick the most detailed title
-                        detailed_title = max(titles, key=lambda t: (len(t), t.count(' ')))
-                        # Extract the primary source from the first (highest quality) article
-                        first_article = articles_in_group[0]
-                        primary_feed = self.db_session.query(Feed).filter_by(id=first_article.feed_id).first()
-                        primary_source = primary_feed.title if primary_feed else "Unknown Feed"
-                        
-                        # Format like user's example: "Title (Primary Source/Author)"
-                        summary_items.append(f"### {detailed_title}")
-                    else:
-                        summary_items.append(f"### Similar Articles ({len(articles_in_group)} sources)")
-                    
-                    # Create source metadata line combining all sources
-                    source_info = []
-                    all_dates = []
-                    all_tiers = []
-                    
-                    for article in articles_in_group:
-                        feed = self.db_session.query(Feed).filter_by(id=article.feed_id).first()
-                        feed_name = feed.title if feed else "Unknown Feed"
-                        source_info.append(feed_name)
-                        
-                        if article.published_at:
-                            all_dates.append(article.published_at)
-                        if article.quality_tier:
-                            all_tiers.append(article.quality_tier)
-                    
-                    # Use most recent date and best quality tier
-                    best_date = max(all_dates).strftime("%Y-%m-%d") if all_dates else "Unknown date"
-                    best_tier = min(all_tiers, key=lambda t: ["S", "A", "B", "C", "D"].index(t)) if all_tiers else ""
-                    tier_display = f"{best_tier}-Tier" if best_tier else ""
-                    
-                    # Create sources line showing multiple sources
-                    if len(source_info) > 1:
-                        sources_display = f"Multiple sources | {best_date} | {tier_display}"
-                    else:
-                        sources_display = f"{source_info[0]} | {best_date} | {tier_display}"
-                    
-                    summary_items.append(f"*{sources_display}*")
-                    summary_items.append("")
-                    
-                    # List all article URLs
-                    for article in articles_in_group:
-                        summary_items.append(article.url)
-                        summary_items.append("")
-                    
-                    # Use the summary from the best/first article, or combined summary if available
-                    best_article = articles_in_group[0]  # Already sorted by quality
-                    if best_article.summary:
-                        summary_items.append(f"{best_article.summary}\n")
-                    
-                    # Add source attribution at the end for merged stories
-                    if len(articles_in_group) > 1:
-                        source_attribution = []
-                        for i, article in enumerate(articles_in_group, 1):
-                            feed = self.db_session.query(Feed).filter_by(id=article.feed_id).first()
-                            feed_name = feed.title if feed else "Unknown Feed"
-                            source_attribution.append(f"Source {i}: {feed_name}")
-                        summary_items.append(f"*Sources: {', '.join(source_attribution)}*\n")
+                    continue
+
+                # Multiple articles covering the same story - display as a
+                # merged story headed by the stable representative, retaining
+                # every confirmed source
+                logger.info(f"Displaying {len(members)} similar articles as a merged story")
+
+                # Stable block anchor: digest links targeting the group keep
+                # resolving even when the representative is replaced by a more
+                # authoritative version in a later run
+                anchor_suffix = f" ^{view['anchor']}" if view["anchor"] else ""
+                summary_items.append(f"### {representative.title}{anchor_suffix}")
+
+                # Metadata line: every confirmed source by name, best date and
+                # tier, and the similarity threshold the group was merged at
+                source_names = []
+                all_dates = []
+                all_tiers = []
+                for member in members:
+                    feed = self.db_session.query(Feed).filter_by(id=member.feed_id).first()
+                    source_names.append(feed.title if feed else "Unknown Feed")
+                    if member.published_at:
+                        all_dates.append(member.published_at)
+                    if member.quality_tier:
+                        all_tiers.append(member.quality_tier)
+
+                best_date = max(all_dates).strftime("%Y-%m-%d") if all_dates else "Unknown date"
+                best_tier = min(all_tiers, key=lambda t: ["S", "A", "B", "C", "D"].index(t)) if all_tiers else ""
+                tier_display = f"{best_tier}-Tier" if best_tier else ""
+                sources_display = " + ".join(dict.fromkeys(source_names))
+                threshold_display = f"merged at ≥{view['threshold']:.2f} similarity"
+
+                summary_items.append(f"*{sources_display} | {best_date} | {tier_display} | {threshold_display}*")
+                summary_items.append("")
+
+                # Representative (canonical) URL first
+                summary_items.append(representative.url)
+                summary_items.append("")
+
+                # Use the representative's (grouped) summary, falling back to
+                # any member's summary
+                summary_text = representative.summary or next((m.summary for m in members if m.summary), None)
+                if summary_text:
+                    summary_items.append(f"{summary_text}\n")
+
+                # Retain every confirmed source for the story
+                summary_items.append(f"*Confirmed sources ({len(members)}):*")
+                for i, member in enumerate(members, 1):
+                    feed = self.db_session.query(Feed).filter_by(id=member.feed_id).first()
+                    feed_name = feed.title if feed else "Unknown Feed"
+                    member_date = member.published_at.strftime("%Y-%m-%d") if member.published_at else "Unknown date"
+                    member_tier = f"{member.quality_tier}-Tier" if member.quality_tier else "unrated"
+                    marker = " (representative)" if member.id == representative.id else ""
+                    summary_items.append(f"{i}. **{feed_name}** — {member_date} — {member_tier}{marker}: {member.url}")
+                summary_items.append("")
+
+                # Record persistent group metadata for downstream consumers
+                if view["story_group"] is not None:
+                    gid = view["story_group"].id
+                    if gid not in story_group_entries:
+                        story_group_entries[gid] = {
+                            "group_id": gid,
+                            "anchor": view["anchor"],
+                            "similarity_threshold": view["story_group"].similarity_threshold,
+                            "representative_article_id": view["story_group"].representative_article_id,
+                            "member_article_ids": [m.id for m in view["story_group"].members],
+                            "persistent": True,
+                        }
 
         # Build feed stats
         feed_stats_dict = defaultdict(lambda: {"total": 0, "accepted": 0})
@@ -1458,7 +1892,8 @@ Provide a comprehensive summary that synthesizes information from all sources.""
             "feed_stats": "\n".join(feed_stats),
             "articles": high_value_articles,
             "aggregated_summary": aggregated_summary,
-            "filename": formatted_filename
+            "filename": formatted_filename,
+            "story_groups": list(story_group_entries.values())
         }
 
         return digest

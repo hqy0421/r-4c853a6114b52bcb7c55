@@ -38,6 +38,32 @@ class Feed(Base):
         return f"<Feed(id={self.id}, title='{self.title}', muted={self.muted}, peer_through={self.peer_through})>"
 
 
+class StoryGroup(Base):
+    """Persistent group of articles covering the same story (e.g. one news
+    item reposted by multiple public sources).
+
+    Group identity is stable across ingest runs: members keep their
+    ``group_id`` even when the representative article is later replaced by a
+    more authoritative version, so old index entries (vector index ids, old
+    digest links) can always be resolved back to the group.
+    """
+    __tablename__ = "story_groups"
+
+    id = Column(Integer, primary_key=True)
+    representative_article_id = Column(Integer, ForeignKey("articles.id"), nullable=True)
+    # Similarity threshold that was in effect when the group was formed
+    similarity_threshold = Column(Float, nullable=False, default=0.65)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    # Relationships
+    members = relationship("Article", back_populates="group", foreign_keys="Article.group_id")
+    representative = relationship("Article", foreign_keys=[representative_article_id])
+
+    def __repr__(self) -> str:
+        return f"<StoryGroup(id={self.id}, representative_article_id={self.representative_article_id}, threshold={self.similarity_threshold})>"
+
+
 class Article(Base):
     """Model for articles from RSS feeds."""
     __tablename__ = "articles"
@@ -62,27 +88,42 @@ class Article(Base):
     embedding_vector = Column(Text, nullable=True)  # JSON-serialized embedding vector
     word_count = Column(Integer, nullable=True)
     jina_enhanced = Column(Boolean, default=False)  # Flag to indicate if content was fetched from Jina.ai
-    
+    group_id = Column(Integer, ForeignKey("story_groups.id"), nullable=True)  # Persistent story group membership
+
     # Relationships
     feed = relationship("Feed", back_populates="articles")
+    group = relationship("StoryGroup", back_populates="members", foreign_keys=[group_id])
 
     def __repr__(self) -> str:
         return f"<Article(id={self.id}, title='{self.title[:30]}...', quality_tier='{self.quality_tier or 'None'}')>"
 
 
+def _migrate_schema(engine) -> None:
+    """Apply lightweight schema migrations for existing databases.
+
+    Creates any missing tables (e.g. story_groups) and adds any missing
+    columns to existing tables, so databases created by older versions of
+    RSSidian keep working without manual intervention.
+    """
+    from sqlalchemy import inspect, text
+
+    # Create tables that don't exist yet (no-op for existing ones)
+    Base.metadata.create_all(engine)
+
+    inspector = inspect(engine)
+    columns = [col["name"] for col in inspector.get_columns("articles")]
+    with engine.connect() as conn:
+        if "embedding_vector" not in columns:
+            conn.execute(text("ALTER TABLE articles ADD COLUMN embedding_vector TEXT"))
+        if "group_id" not in columns:
+            conn.execute(text("ALTER TABLE articles ADD COLUMN group_id INTEGER REFERENCES story_groups(id)"))
+        conn.commit()
+
+
 def init_db(db_path: str) -> Session:
     """Initialize database and return session."""
     engine = create_engine(f"sqlite:///{db_path}")
-    Base.metadata.create_all(engine)
-
-    # Migrate: add embedding_vector column if missing (existing databases)
-    from sqlalchemy import inspect, text
-    inspector = inspect(engine)
-    columns = [col["name"] for col in inspector.get_columns("articles")]
-    if "embedding_vector" not in columns:
-        with engine.connect() as conn:
-            conn.execute(text("ALTER TABLE articles ADD COLUMN embedding_vector TEXT"))
-            conn.commit()
+    _migrate_schema(engine)
 
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     return SessionLocal()
@@ -91,15 +132,7 @@ def init_db(db_path: str) -> Session:
 def get_db_session(db_path: str) -> Session:
     """Get a database session."""
     engine = create_engine(f"sqlite:///{db_path}")
-
-    # Migrate: add embedding_vector column if missing (existing databases)
-    from sqlalchemy import inspect, text
-    inspector = inspect(engine)
-    columns = [col["name"] for col in inspector.get_columns("articles")]
-    if "embedding_vector" not in columns:
-        with engine.connect() as conn:
-            conn.execute(text("ALTER TABLE articles ADD COLUMN embedding_vector TEXT"))
-            conn.commit()
+    _migrate_schema(engine)
 
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     return SessionLocal()

@@ -28,6 +28,8 @@ RSSidian is a powerful tool that bridges your RSS feed subscriptions with Obsidi
 - **Digest Generation**:
   - Creates comprehensive digest notes in Obsidian
   - Collapses similar/overlapping stories for concise presentation
+  - Persistent story groups: reposts of the same story from multiple public sources are merged into a stable group that records the similarity threshold used and elects the most authoritative article as its representative
+  - Merged stories retain every confirmed source (outlet, date, quality tier, URL) and are headed by a stable `^story-group-N` block anchor, so digest links keep resolving even when the representative is replaced by a more authoritative version later
   - Organizes content by quality tier and relevance
   - Includes feed statistics and processing metrics
 - **Natural Language Search**:
@@ -157,6 +159,24 @@ n_trees = 10
 # Distance metric (angular = cosine similarity)
 metric = "angular"
 ```
+
+### Persistent Story Groups
+
+When several public sources repost the same story, RSSidian merges the
+articles into a **story group** that is persisted in the database:
+
+- The group records the **similarity threshold** in effect when it was formed
+  (`feeds.similarity_threshold`; `feeds.digest_similarity_threshold` is only a
+  fallback for articles processed before story groups existed).
+- The most authoritative version (quality tier → score → detail → earliest
+  publication) is elected as the group's **stable representative**.
+- Digests render merged stories under the representative's title with a stable
+  `^story-group-N` block anchor, list the merge threshold, and retain **every
+  confirmed source** (outlet, date, tier, URL).
+- If a more authoritative version arrives later, it joins the group and takes
+  over as representative — but every earlier member keeps its `group_id`, so
+  old vector-index entries and old digest links still resolve to the group
+  (`RSSProcessor.resolve_story_group(article_id)`).
 
 ## Usage
 

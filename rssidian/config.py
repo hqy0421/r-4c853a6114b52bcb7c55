@@ -152,6 +152,12 @@ Content:
     def similarity_threshold(self) -> float:
         """Get similarity threshold for duplicate detection and story merging."""
         return self.get("feeds", "similarity_threshold", 0.65)
+
+    @property
+    def digest_similarity_threshold(self) -> float:
+        """Get similarity threshold for digest-time grouping of legacy articles
+        that have no persistent story group (fallback only)."""
+        return self.get("feeds", "digest_similarity_threshold", 0.6)
     
     @property
     def excerpt_length(self) -> int:

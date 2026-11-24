@@ -610,6 +610,7 @@ def ingest(ctx, lookback, debug):
             click.echo(f"  With summaries: {process_result['with_summary']}")
             click.echo(f"  With value analysis: {process_result['with_value']}")
             click.echo(f"  With embeddings: {process_result['with_embedding']}")
+            click.echo(f"  Story groups: {process_result['story_groups']}")
 
         # Step 2b: Backfill embeddings for articles processed during ingestion
         # When analyze_during_ingestion=True, articles get processed=True in rss.py
@@ -618,6 +619,15 @@ def ingest(ctx, lookback, debug):
         if backfill_result['total'] > 0:
             click.echo(f"Backfilled embeddings: {backfill_result['succeeded']}/{backfill_result['total']} "
                        f"({backfill_result['failed']} failed)")
+
+        # Step 2c: Assign persistent story groups to any articles that don't
+        # have one yet (e.g. articles analyzed during ingestion). Groups keep
+        # a stable representative and record the similarity threshold used, so
+        # digests can merge reposted stories and old links keep resolving.
+        story_groups = processor.assign_story_groups()
+        if story_groups:
+            click.echo(f"Story groups: assigned {len(story_groups)} groups "
+                       f"(stable representatives + merge thresholds recorded)")
 
         # Step 3: Generate digest
         click.echo("Generating digest...")
